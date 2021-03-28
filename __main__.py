@@ -9,6 +9,7 @@ import shlex
 import tempfile
 import re
 import hashlib
+import pickle
 
 import anytree
 
@@ -26,18 +27,20 @@ def find_sources(paths, extensions):
                     sources.add(os.path.join(curdir, f))
     return sorted(sources)
 
+def print_cmd(cmd):
+    print(' '.join([shlex.quote(x) for x in cmd]))
+
 def timed_run(cmd, **kwargs):
     tmpfile = tempfile.NamedTemporaryFile('r')
+    print_cmd(cmd)
     cmd = [
         '/usr/bin/time',
         '--output', tmpfile.name,
         '--format', re.sub(r': "(%.)"', r': \1', json.dumps({
             'status': '%x',
-            'time': {
-                'wall': '%e',
-                'sys': '%S',
-                'user': '%U'
-            },
+            'wall': '%e',
+            'sys': '%S',
+            'user': '%U',
             'fault': {
                 'major': '%F',
                 'minor': '%R',
@@ -48,7 +51,11 @@ def timed_run(cmd, **kwargs):
         }))
     ] + cmd
     proc = subprocess.run(cmd, **kwargs)
-    return proc, json.load(tmpfile)
+    js = {'status': -1}
+    if proc.returncode == 0:
+        js = json.load(tmpfile)
+        js['cpu'] = js['sys'] + js['user']
+    return proc, js
 
 def atomic_write(path, content):
     dirname = os.path.dirname(path)
@@ -56,12 +63,34 @@ def atomic_write(path, content):
         os.makedirs(dirname)
     tmpname = '%s.tmp' %(path)
     with open(tmpname, 'wb') as outf:
-        outf.write(content)
+        pickle.dump(content, outf)
     os.rename(tmpname, path)
+
+def cached(func):
+    def wrapper(obj, *args):
+        ret = None
+        cache = None
+        if obj.cache_dir:
+            hsh = hashlib.sha256(b'v1')
+            hsh.update(func.__name__.encode('utf-8'))
+            for arg in args:
+                hsh.update(arg.encode('utf-8'))
+            hdigest = hsh.hexdigest()
+            cache = os.path.join(obj.cache_dir, hdigest[0], hdigest)
+        if cache and os.path.exists(cache):
+            ret = pickle.load(open(cache, 'rb'))
+        else:
+            ret = func(obj, *args)
+            if cache:
+                atomic_write(cache, ret)
+        return ret
+    return wrapper
 
 class Header:
     def __init__(self):
         self.count = 0
+        self.failed = None
+        self.time = None
 
 class Compiler:
     def __init__(self, bin_path, flags):
@@ -70,7 +99,6 @@ class Compiler:
 
     def _cmd(self, source, *flags):
         cmd = self._args + list(flags) + [source]
-        print(' '.join([shlex.quote(x) for x in cmd]))
         return cmd
 
     def includes(self, sources,  *flags):
@@ -107,30 +135,28 @@ class Compiler:
         return self._output('stdout', source, *flags)
     def stderr(self, source, *flags):
         return self._output('stderr', source, *flags)
+
+    @cached
     def _output(self, which, source, *flags):
-        cmd = self._cmd(source, *flags)
-
-        cache = None
-        if self.cache_dir:
-            hsh = hashlib.sha256(which.encode('utf-8'))
-            for x in cmd:
-                hsh.update(x.encode('utf-8'))
-            hdigest = hsh.hexdigest()
-            cache = os.path.join(self.cache_dir, hdigest[0], hdigest)
-        if cache and os.path.exists(cache):
-            return open(cache, 'rb').read().decode('utf-8')
-
         try:
+            cmd = self._cmd(source, *flags)
+            print_cmd(cmd)
             proc = subprocess.run(cmd, check=True, capture_output=True)
-            s = (proc.stderr if which == 'stderr' else proc.stdout)
-            if cache:
-                atomic_write(cache, s)
+            s = proc.stderr if which == 'stderr' else proc.stdout
             return s.decode('utf-8')
         except subprocess.CalledProcessError as e:
             print(e.stderr.decode('utf-8'))
 
     def time(self, source, *flags):
         return timed_run(self._cmd(source, *flags))[1]
+
+    @cached
+    def time_header(self, header, *flags):
+        tmpfile = tempfile.NamedTemporaryFile(
+            'wb', suffix='.cpp', buffering=0)
+        tmpfile.write(f'#include <{header}>'.encode('utf-8'))
+        return self.time(tmpfile.name, '-c', *flags)
+
 
 def main():
     parser = argparse.ArgumentParser(description='Compiler Profiler')
@@ -140,6 +166,7 @@ def main():
     subparsers = parser.add_subparsers(dest='mode', required=True)
     subparser = subparsers.add_parser('header')
     subparser.add_argument('--min-refs', type=int, default=2)
+    subparser.add_argument('--min-duration', type=float, default=0.1)
     subparser.add_argument('paths', nargs='+')
 
     args = parser.parse_args()
@@ -152,13 +179,43 @@ def main():
     # for source in sources:
     #     t = cc.time(source, '-c')
     #     assert t['status'] == 0
-    #     wall_times[source] = t['time']['wall']
+    #     wall_times[source] = t['cpu']
     # print(wall_times)
 
     htree, headers = cc.includes(sources)
     for hnode in anytree.LevelOrderIter(htree):
-        if hnode.header.count < args.min_refs:
+        if hnode.header.count < args.min_refs or \
+           hnode.header.time:
             continue
-        print(hnode.header.count, hnode.name)
+
+        if any([
+                x.header.time \
+                and x.header.time['status'] == 0 \
+                and x.header.time['cpu'] < args.min_duration
+                for x in hnode.ancestors]):
+            continue
+        hnode.header.time = cc.time_header(hnode.name)
+
+    # headers_by_time = sorted(
+    #     [
+    #         x for x, y in headers.items()
+    #         if (y.time and
+    #             y.time['status'] == 0 and
+    #             y.time['cpu'] >= args.min_duration)
+    #     ],
+    #     key=lambda x: headers[x].time['cpu'] * headers[x].count,
+    #     reverse=True)
+    printed = set()
+    for hnode in anytree.LevelOrderIter(htree):
+        if hnode.name not in printed and \
+           hnode.header.time and \
+           hnode.header.time['status'] == 0 and \
+           hnode.header.time['cpu'] >= args.min_duration:
+            printed.add(hnode.name)
+            print('%d %d x %0.1fs: %s' %(
+                hnode.depth,
+                hnode.header.count,
+                hnode.header.time['cpu'],
+                hnode.name))
 
 main()
