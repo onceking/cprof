@@ -59,12 +59,19 @@ def timed_run(cmd, **kwargs):
 
 def atomic_write(path, content):
     dirname = os.path.dirname(path)
-    if not os.path.exists(dirname):
+    if dirname and not os.path.exists(dirname):
         os.makedirs(dirname)
     tmpname = '%s.tmp' %(path)
     with open(tmpname, 'wb') as outf:
-        pickle.dump(content, outf)
+        outf.write(content.encode('utf-8') if isinstance(content, str) else content)
+    os.chmod(tmpname, 0o666)
     os.rename(tmpname, path)
+
+def write_csv(path, header, rows):
+    s = ','.join(header) + '\n'
+    for row in rows:
+        s += ','.join(row) + '\n'
+    atomic_write(path + '.csv', s)
 
 def cached(func):
     def wrapper(obj, *args):
@@ -82,15 +89,25 @@ def cached(func):
         else:
             ret = func(obj, *args)
             if cache:
-                atomic_write(cache, ret)
+                atomic_write(cache, pickle.dumps(ret))
         return ret
     return wrapper
+
+def filter_up(node, func):
+    if func(node):
+        return True
+    for i in node.ancestors:
+        if func(i):
+            return True
+    return False
 
 class Header:
     def __init__(self):
         self.count = 0
-        self.failed = None
         self.time = None
+
+    def ok(self):
+        return self.time and self.time['status'] == 0
 
 class Compiler:
     def __init__(self, bin_path, flags):
@@ -167,6 +184,7 @@ def main():
     subparser = subparsers.add_parser('header')
     subparser.add_argument('--min-refs', type=int, default=2)
     subparser.add_argument('--min-duration', type=float, default=0.1)
+    subparser.add_argument('--common-pct', type=float, default=90)
     subparser.add_argument('paths', nargs='+')
 
     args = parser.parse_args()
@@ -181,41 +199,80 @@ def main():
     #     assert t['status'] == 0
     #     wall_times[source] = t['cpu']
     # print(wall_times)
+    if args.mode == 'header':
+        act_header(cc, sources, args)
 
+
+def write_header_csv(name, headers, keys):
+    if not keys:
+        return
+
+    write_csv(
+        f'header.{name}',
+        ['count', 'time', 'tot', 'path'],
+        [
+            (
+                str(headers[x].count),
+                '%0.1f' %(headers[x].time['cpu']),
+                '%0.1f' %(headers[x].time['cpu'] * headers[x].count),
+                x
+            )
+            for x in sorted(keys, key=lambda x: -headers[x].time['cpu'] * headers[x].count)
+        ])
+
+def act_header(cc, sources, args):
     htree, headers = cc.includes(sources)
-    for hnode in anytree.LevelOrderIter(htree):
-        if hnode.header.count < args.min_refs or \
-           hnode.header.time:
+    for node in anytree.LevelOrderIter(htree):
+        if node.header.count < args.min_refs or \
+           node.header.time:
             continue
 
-        if any([
-                x.header.time \
-                and x.header.time['status'] == 0 \
-                and x.header.time['cpu'] < args.min_duration
-                for x in hnode.ancestors]):
+        if filter_up(node, lambda x: x.header.ok() and x.header.time['cpu'] < args.min_duration):
             continue
-        hnode.header.time = cc.time_header(hnode.name)
+        node.header.time = cc.time_header(node.name)
 
-    # headers_by_time = sorted(
-    #     [
-    #         x for x, y in headers.items()
-    #         if (y.time and
-    #             y.time['status'] == 0 and
-    #             y.time['cpu'] >= args.min_duration)
-    #     ],
-    #     key=lambda x: headers[x].time['cpu'] * headers[x].count,
-    #     reverse=True)
-    printed = set()
-    for hnode in anytree.LevelOrderIter(htree):
-        if hnode.name not in printed and \
-           hnode.header.time and \
-           hnode.header.time['status'] == 0 and \
-           hnode.header.time['cpu'] >= args.min_duration:
-            printed.add(hnode.name)
-            print('%d %d x %0.1fs: %s' %(
-                hnode.depth,
-                hnode.header.count,
-                hnode.header.time['cpu'],
-                hnode.name))
+    # full
+    content = ''
+    for node in anytree.PreOrderIter(htree):
+        if not node.parent:
+            continue
+        if not node.parent.parent:
+            content += node.name + '\n'
+            continue
+
+        if not node.header.ok():
+            continue
+
+        iter = anytree.LevelOrderGroupIter(node)
+        children = []
+        try:
+            next(iter)
+            children = next(iter)
+        except StopIteration:
+            pass
+        time_self = max(
+            0,
+            node.header.time['cpu'] - sum([
+                child.header.time['cpu'] if child.header.ok() else 0
+                for child in children
+            ]))
+        time_total = node.header.time['cpu']
+
+        content += '%s%0.1f %0.1f %s\n' % (' '*(node.depth-1), time_total, time_self, node.name)
+    atomic_write('header.full.txt', content)
+
+    # common header
+    common = set()
+    common_min = args.common_pct * len(sources) / 100
+    for node in anytree.LevelOrderIter(htree):
+        if node.header.ok() \
+           and node.header.count >= common_min \
+           and node.header.time['cpu'] >= args.min_duration \
+           and not filter_up(node, lambda x: x.name in common):
+            common.add(node.name)
+    write_header_csv('common', headers, common)
+
+    # top headers
+    write_header_csv('top', headers, [x for x in headers if headers[x].ok()])
 
 main()
